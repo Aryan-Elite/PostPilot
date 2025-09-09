@@ -49,3 +49,9 @@ docker-compose.override.yml
 structure.txt
 
 
+# Ignore scraper test JSON data
+/services/scraper/test/data/hashtag_posts/*.json
+/services/scraper/test/data/profile_posts/*.json
+/services/scraper/data/hashtag_posts/*.json
+/services/scraper/data/profile_posts/*.json
+
