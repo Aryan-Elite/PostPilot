@@ -10,8 +10,8 @@ class GeneratedPostItem(BaseModel):
     original_prompt: str
     generated_text: str
     parameters: Dict[str, Any] = Field(default_factory=dict)  # Store topic, tone, length, etc.
-    style_sample_used: Optional[str] = None
-    trending_sample_used: Optional[str] = None
+    style_sample_used: Optional[bool] = None
+    trending_sample_used: Optional[bool] = None
     similarity_score: Optional[float] = None  # Similarity score with style sample
     variation_number: int = 1  # Which variation this is (1, 2, 3, etc.)
     created_at: datetime = Field(default_factory=datetime.utcnow)

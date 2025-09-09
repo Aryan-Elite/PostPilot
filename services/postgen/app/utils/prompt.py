@@ -1,30 +1,73 @@
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 
-post_prompt_template = PromptTemplate(
-    input_variables=["prompt", "topic", "tone", "length", "audience", "style_sample", "trending_sample"],
+HYBRID_POST_TEMPLATE = PromptTemplate(
+    input_variables=["prompt", "topic", "tone", "length", "audience", "user_context", "trending_context"],
     template=(
         "Generate a LinkedIn post: {prompt}\n"
-        "Topic: {topic}. "
-        "Tone: {tone}. "
-        "Length: {length}. "
-        "Target audience: {audience}.\n"
-        "Match this style: {style_sample}\n"
-        "Reference or take inspiration from this trending post: {trending_sample}\n"
-        "Return only the final post text."
+        "Topic: {topic}\n"
+        "Tone: {tone}\n" 
+        "Length: {length}\n"
+        "Target audience: {audience}\n\n"
+        
+        "CONTEXT - Your Previous Similar Posts:\n"
+        "{user_context}\n\n"
+        
+        "CONTEXT - Current Trending Posts:\n" 
+        "{trending_context}\n\n"
+        
+        "Instructions:\n"
+        "- Create original content inspired by both contexts\n"
+        "- Match your previous writing style from similar posts\n"
+        "- Incorporate current trends from trending posts\n"
+        "- Include relevant hashtags\n"
+        "- Keep it authentic and engaging\n\n"
+        
+        "Return only the final post text:"
     )
 )
 
-def build_prompt(
-    prompt, topic=None, tone=None, length=None, audience=None, style_sample=None, trending_sample=None
-):
-    # Fill defaults with empty strings to avoid None in prompt
-    prompt_vals = {
+# Simple fallback template
+SIMPLE_POST_TEMPLATE = PromptTemplate(
+    input_variables=["prompt"],
+    template="{prompt}"
+)
+
+# Q&A template for retrieval chains
+QA_TEMPLATE = PromptTemplate.from_template(
+    """Answer the question based only on the following context:
+    {context}
+    
+    Question: {input}
+    
+    Answer:"""
+)
+
+
+def build_hybrid_prompt_values(
+    prompt: str, topic: str = None, tone: str = None, length: str = None, 
+    audience: str = None, user_context: str = None, trending_context: str = None
+) -> dict:
+    """
+    Build prompt values for hybrid generation (RAG + Trending)
+    
+    Args:
+        prompt: Main prompt text
+        topic: Topic for the post  
+        tone: Desired tone
+        length: Desired length
+        audience: Target audience
+        user_context: User's previous similar posts from RAG
+        trending_context: Scraped trending posts
+        
+    Returns:
+        Dictionary of prompt values with empty string defaults
+    """
+    return {
         "prompt": prompt or "",
         "topic": topic or "",
-        "tone": tone or "",
-        "length": length or "",
+        "tone": tone or "professional", 
+        "length": length or "medium",
         "audience": audience or "",
-        "style_sample": style_sample or "",
-        "trending_sample": trending_sample or ""
+        "user_context": user_context or "No previous posts found.",
+        "trending_context": trending_context or "No trending posts available."
     }
-    return post_prompt_template.format(**prompt_vals)

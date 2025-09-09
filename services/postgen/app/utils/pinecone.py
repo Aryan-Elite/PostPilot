@@ -2,40 +2,45 @@ from pinecone import Pinecone, ServerlessSpec
 from typing import List, Dict, Any, Optional
 import uuid
 import time
+import re
+from collections import Counter
+import math
 from app.config import PINECONE_API_KEY, PINECONE_ENVIRONMENT, PINECONE_INDEX_NAME
 from app.utils.embeddings import get_embedding
 
-class PineconeService:
-    def __init__(self):
+class PineconeHybridSearchService:
+    """Optimized Pinecone service with hybrid search - production ready"""
+    
+    def __init__(self, alpha: float = 0.5):
+        """
+        Initialize Pinecone service
+        
+        Args:
+            alpha: Weight for semantic vs keyword search (0.0-1.0)
+        """
         self.pc = None
         self.index = None
+        self.alpha = alpha
         self.initialize_pinecone()
     
     def initialize_pinecone(self):
         """Initialize Pinecone connection and index"""
         try:
-            # New way to connect
             self.pc = Pinecone(api_key=PINECONE_API_KEY)
-
-            # List existing indexes
             existing_indexes = [i["name"] for i in self.pc.list_indexes()]
 
-            # Create index if it doesn't exist
             if PINECONE_INDEX_NAME not in existing_indexes:
                 print(f"Creating Pinecone index: {PINECONE_INDEX_NAME}")
                 self.pc.create_index(
                     name=PINECONE_INDEX_NAME,
-                    dimension=1536,  # OpenAI embedding dimension
+                    dimension=1536,
                     metric="cosine",
                     spec=ServerlessSpec(
-                        cloud="aws",      # adjust if needed
-                        region=PINECONE_ENVIRONMENT  # make sure this matches your .env
+                        cloud="aws",
+                        region=PINECONE_ENVIRONMENT
                     ),
                 )
-                # Wait for index to be ready
-                while PINECONE_INDEX_NAME not in [
-                    i["name"] for i in self.pc.list_indexes()
-                ]:
+                while PINECONE_INDEX_NAME not in [i["name"] for i in self.pc.list_indexes()]:
                     time.sleep(1)
 
             self.index = self.pc.Index(PINECONE_INDEX_NAME)
@@ -45,36 +50,55 @@ class PineconeService:
             print(f"Error initializing Pinecone: {e}")
             raise
 
+    def _preprocess_text(self, text: str) -> List[str]:
+        """Extract keywords from text"""
+        text = re.sub(r'[^\w\s]', ' ', text.lower())
+        return [word for word in text.split() if len(word) > 2]
+
+    def _calculate_bm25_score(self, query_terms: List[str], doc_text: str) -> float:
+        """Calculate BM25 score for keyword matching"""
+        k1, b = 1.5, 0.75
+        doc_terms = self._preprocess_text(doc_text)
+        doc_length = len(doc_terms)
+        doc_term_freq = Counter(doc_terms)
+        
+        score = 0.0
+        for term in query_terms:
+            if term in doc_term_freq:
+                tf = doc_term_freq[term]
+                idf = math.log(1000 / 2)  # Simplified IDF
+                numerator = tf * (k1 + 1)
+                denominator = tf + k1 * (1 - b + b * (doc_length / 100.0))
+                score += idf * (numerator / denominator)
+        
+        return min(score / 10.0, 1.0)  # Normalize to 0-1
+
     def store_user_posts(self, username: str, posts: List[Dict[str, Any]]) -> bool:
-        """Store user's posts in Pinecone with embeddings"""
+        """Store user posts with embeddings"""
         try:
             vectors_to_upsert = []
             
             for post in posts:
-                # Get the post content (adjust field names based on your data structure)
                 post_content = post.get("content", "") or post.get("text", "") or post.get("post_text", "")
                 
                 if not post_content or len(post_content.strip()) < 10:
-                    continue  # Skip very short or empty posts
-                
-                # Generate embedding for the post
-                embedding = get_embedding(post_content)
-                if not embedding:
-                    print(f"Failed to generate embedding for post: {post_content[:50]}...")
                     continue
                 
-                # Create unique ID for this post
-                post_id = f"{username}_{post.get('post_id', str(uuid.uuid4()))}"
+                embedding = get_embedding(post_content)
+                if not embedding:
+                    continue
                 
-                # Prepare metadata
+                post_id = f"{username}_{post.get('post_id', str(uuid.uuid4()))}"
+                keywords = self._preprocess_text(post_content)
+                
                 metadata = {
                     "username": username,
-                    "content": post_content[:1000],  # Limit content length for metadata
+                    "content": post_content[:1000],
                     "post_id": post.get("post_id", ""),
-                    "scraped_at": post.get("scraped_at", ""),
                     "likes": post.get("likes", 0),
                     "comments": post.get("comments", 0),
-                    "reposts": post.get("reposts", 0)
+                    "reposts": post.get("reposts", 0),
+                    "keywords": " ".join(keywords[:50])
                 }
                 
                 vectors_to_upsert.append({
@@ -84,146 +108,117 @@ class PineconeService:
                 })
             
             if vectors_to_upsert:
-                # Upsert in batches of 100
+                # Upsert in batches
                 batch_size = 100
                 for i in range(0, len(vectors_to_upsert), batch_size):
                     batch = vectors_to_upsert[i:i + batch_size]
                     self.index.upsert(vectors=batch)
-                    print(f"Upserted batch {i//batch_size + 1} with {len(batch)} vectors")
                 
                 print(f"Successfully stored {len(vectors_to_upsert)} posts for {username}")
                 return True
-            else:
-                print(f"No valid posts to store for {username}")
-                return False
+            
+            return False
                 
         except Exception as e:
             print(f"Error storing posts for {username}: {e}")
             return False
 
-    def find_similar_post(self, username: str, query: str, top_k: int = 1) -> Optional[str]:
-        """Find similar posts by a specific user based on query"""
-        try:
-            # Generate embedding for the query
-            query_embedding = get_embedding(query)
-            if not query_embedding:
-                print("Failed to generate embedding for query")
-                return None
+    def hybrid_search(self, query: str, username: str = None, top_k: int = 5, 
+                     alpha: Optional[float] = None) -> List[Dict[str, Any]]:
+        """
+        Main search method - hybrid semantic + keyword search
+        """
+        if alpha is None:
+            alpha = self.alpha
             
-            # Search for similar posts by this specific user
-            results = self.index.query(
-                vector=query_embedding,
-                filter={"username": username},
-                top_k=top_k,
-                include_metadata=True
-            )
-            
-            if results.matches:
-                # Return the content of the most similar post
-                best_match = results.matches[0]
-                content = best_match.metadata.get("content", "")
-                print(f"Found similar post with score {best_match.score:.3f}")
-                return content
-            else:
-                print(f"No similar posts found for user {username}")
-                return None
-                
-        except Exception as e:
-            print(f"Error finding similar post: {e}")
-            return None
-
-    def search_similar_posts(self, query: str, username: str = None, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Search for similar posts across all users or for a specific user"""
         try:
+            # Get query embedding
             query_embedding = get_embedding(query)
             if not query_embedding:
                 return []
             
             # Build filter
-            filter_dict = {}
-            if username:
-                filter_dict["username"] = username
+            filter_dict = {"username": username} if username else None
+            search_k = min(top_k * 3, 50)
             
-            results = self.index.query(
+            # Semantic search
+            semantic_results = self.index.query(
                 vector=query_embedding,
-                filter=filter_dict if filter_dict else None,
-                top_k=top_k,
+                filter=filter_dict,
+                top_k=search_k,
                 include_metadata=True
             )
             
-            similar_posts = []
-            for match in results.matches:
-                similar_posts.append({
-                    "content": match.metadata.get("content", ""),
+            # Combine with keyword scoring
+            query_terms = self._preprocess_text(query)
+            combined_results = {}
+            
+            for match in semantic_results.matches:
+                doc_content = match.metadata.get("content", "")
+                semantic_score = float(match.score)
+                keyword_score = self._calculate_bm25_score(query_terms, doc_content)
+                combined_score = alpha * semantic_score + (1 - alpha) * keyword_score
+                
+                combined_results[match.id] = {
+                    "id": match.id,
+                    "content": doc_content,
                     "username": match.metadata.get("username", ""),
-                    "score": match.score,
+                    "semantic_score": semantic_score,
+                    "keyword_score": keyword_score,
+                    "combined_score": combined_score,
                     "post_id": match.metadata.get("post_id", ""),
                     "likes": match.metadata.get("likes", 0),
-                    "comments": match.metadata.get("comments", 0)
-                })
+                    "comments": match.metadata.get("comments", 0),
+                    "reposts": match.metadata.get("reposts", 0)
+                }
             
-            return similar_posts
+            # Sort by combined score
+            sorted_results = sorted(
+                combined_results.values(),
+                key=lambda x: x["combined_score"],
+                reverse=True
+            )
+            
+            return sorted_results[:top_k]
             
         except Exception as e:
-            print(f"Error searching similar posts: {e}")
+            print(f"Error in hybrid search: {e}")
             return []
 
     def delete_user_posts(self, username: str) -> bool:
-        """Delete all posts for a specific user"""
+        """Delete all posts for a user"""
         try:
-            # First, get all post IDs for this user
             query_response = self.index.query(
-                vector=[0.0] * 1536,  # Dummy vector
+                vector=[0.0] * 1536,
                 filter={"username": username},
-                top_k=10000,  # Large number to get all posts
+                top_k=10000,
                 include_metadata=True
             )
             
             if query_response.matches:
                 post_ids = [match.id for match in query_response.matches]
                 
-                # Delete in batches
                 batch_size = 1000
                 for i in range(0, len(post_ids), batch_size):
                     batch = post_ids[i:i + batch_size]
                     self.index.delete(ids=batch)
                 
                 print(f"Deleted {len(post_ids)} posts for user {username}")
-                return True
-            else:
-                print(f"No posts found to delete for user {username}")
-                return True
+            
+            return True
                 
         except Exception as e:
             print(f"Error deleting posts for {username}: {e}")
             return False
 
-    def get_index_stats(self) -> Dict[str, Any]:
-        """Get statistics about the Pinecone index"""
-        try:
-            stats = self.index.describe_index_stats()
-            return {
-                "total_vectors": stats.total_vector_count,
-                "dimension": stats.dimension,
-                "index_fullness": stats.index_fullness,
-                "namespaces": dict(stats.namespaces) if stats.namespaces else {}
-            }
-        except Exception as e:
-            print(f"Error getting index stats: {e}")
-            return {}
-
     def update_user_posts(self, username: str, new_posts: List[Dict[str, Any]]) -> bool:
-        """Update posts for a user (delete old ones and add new ones)"""
+        """Replace all posts for a user"""
         try:
-            # Delete existing posts
             self.delete_user_posts(username)
-            
-            # Add new posts
             return self.store_user_posts(username, new_posts)
-            
         except Exception as e:
             print(f"Error updating posts for {username}: {e}")
             return False
 
-# Create the global instance
-pinecone_service = PineconeService()
+# Global instance
+pinecone_service = PineconeHybridSearchService(alpha=0.5)

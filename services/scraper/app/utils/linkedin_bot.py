@@ -218,7 +218,7 @@ class LinkedInBot:
             return False
 
     async def scrape_user_posts(self, profile_url, n_posts=5):
-        """Scrape posts from LinkedIn profile with enhanced selectors and data extraction"""
+        """Scrape posts from LinkedIn profile with enhanced navigation and fallback strategies"""
         try:
             # Ensure we're logged in before scraping
             if not await self.ensure_logged_in():
@@ -230,9 +230,70 @@ class LinkedInBot:
             # Wait for page to load
             await asyncio.sleep(4)
             
-            # Try to click into posts tab
+            posts_data = []
+            posts_tab_success = False
+            
+            # Strategy 1: Try to navigate to dedicated posts page
+            print("🔍 Attempting to navigate to dedicated posts page...")
+            try:
+                # Multiple strategies to get to posts page
+                posts_page_urls = [
+                    f"{profile_url.rstrip('/')}/recent-activity/all/",
+                    f"{profile_url.rstrip('/')}/recent-activity/posts/",
+                    f"{profile_url.rstrip('/')}/recent-activity/"
+                ]
+                
+                for posts_url in posts_page_urls:
+                    try:
+                        print(f"🔍 Trying direct navigation to: {posts_url}")
+                        await self.page.goto(posts_url, wait_until="domcontentloaded")
+                        await asyncio.sleep(4)
+                        
+                        # Check if we successfully landed on posts page
+                        current_url = self.page.url
+                        if "recent-activity" in current_url:
+                            print("✅ Successfully navigated to posts page via direct URL")
+                            posts_tab_success = True
+                            break
+                            
+                    except Exception as e:
+                        if self.debug:
+                            print(f"⚠️ Direct navigation failed for {posts_url}: {e}")
+                        continue
+                
+                # If direct navigation failed, try clicking the button
+                if not posts_tab_success:
+                    await self.page.goto(profile_url, wait_until="domcontentloaded")
+                    await asyncio.sleep(4)
+                    
+                    posts_tab_success = await self._try_posts_button_click()
+                
+            except Exception as e:
+                print(f"⚠️ Posts page navigation failed: {e}")
+            
+            # Strategy 2: Scrape from current page (either posts page or main profile)
+            if posts_tab_success:
+                print("📜 Scrolling to load posts from dedicated posts page...")
+                # More aggressive scrolling for posts page
+                await self._scroll_and_load_posts_page(n_posts)
+            else:
+                print("📜 Scrolling to load posts from main profile page...")
+                await self._scroll_and_load(n_posts)
+            
+            # Extract posts
+            posts_data = await self._extract_all_posts(n_posts, profile_url)
+            
+            print(f"✅ Scraped {len(posts_data)} posts from {profile_url}")
+            return posts_data
+            
+        except Exception as e:
+            print(f"❌ Error scraping profile posts: {e}")
+            return []
+
+    async def _try_posts_button_click(self):
+        """Try to click the 'Show all posts' button with multiple strategies"""
+        try:
             print("🔍 Looking for 'Show all posts' button...")
-            posts_tab_clicked = False
             
             post_tab_selectors = [
                 "footer a.profile-creator-shared-content-view__footer-action:has-text('Show all posts')",
@@ -247,156 +308,212 @@ class LinkedInBot:
             
             for selector in post_tab_selectors:
                 try:
-                    print(f"🔍 Trying selector: {selector}")
-                    posts_tab = await self.page.wait_for_selector(selector, timeout=8000)
+                    posts_tab = await self.page.wait_for_selector(selector, timeout=5000)
                     if posts_tab:
                         button_text = await posts_tab.inner_text()
                         print(f"✅ Found element with text: '{button_text.strip()}'")
                         
-                        if "show all posts" in button_text.lower():
-                            print(f"✅ Found correct 'Show all posts' button with selector: {selector}")
+                        if "show all posts" in button_text.lower() or "recent-activity" in await posts_tab.get_attribute('href') or '':
+                            print(f"✅ Found posts navigation element with selector: {selector}")
                             
                             await posts_tab.scroll_into_view_if_needed()
                             await asyncio.sleep(1)
-                            await posts_tab.click()
-                            await asyncio.sleep(4)
+                            
+                            # Try different click strategies
+                            try:
+                                await posts_tab.click()
+                            except:
+                                # Fallback: JavaScript click
+                                await self.page.evaluate("(element) => element.click()", posts_tab)
+                            
+                            await asyncio.sleep(5)
                             
                             current_url = self.page.url
                             if "recent-activity" in current_url:
-                                posts_tab_clicked = True
                                 print("✅ Successfully navigated to posts page")
-                                break
+                                return True
                             else:
                                 print("⚠️ Click registered but URL didn't change to posts page")
-                        else:
-                            print(f"⚠️ Element found but text doesn't match: '{button_text}'")
-                            
+                                
                 except PlaywrightTimeoutError:
-                    print(f"⏰ Timeout waiting for selector: {selector}")
                     continue
                 except Exception as e:
                     if self.debug:
                         print(f"⚠️ Error with selector {selector}: {e}")
                     continue
             
-            if not posts_tab_clicked:
-                print("⚠️ Could not find 'Show all posts'. Continuing from main profile...")
-            
-            # Scroll and load posts
-            print("📜 Scrolling to load posts...")
-            await self._scroll_and_load(n_posts)
-            
-            posts_data = []
-            
-            post_selectors = [
-                "div[data-urn*='activity']",
-                "div.feed-shared-update-v2",
-                "article.artdeco-card"
-            ]
-            
-            posts = []
-            for selector in post_selectors:
-                try:
-                    posts = await self.page.query_selector_all(selector)
-                    if posts:
-                        print(f"✅ Found {len(posts)} posts with selector: {selector}")
-                        break
-                except:
-                    continue
-            
-            if not posts:
-                print("❌ No posts found with any selector")
-                return []
-            
-            # Process posts using improved extraction
-            for i, post in enumerate(posts[:n_posts]):
-                if len(posts_data) >= n_posts:
-                    break
-                
-                print(f"🔍 Scraping post {i+1}/{min(n_posts, len(posts))}")
-                
-                try:
-                    # Extract post content
-                    post_text = await self._extract_post_content(post)
-                    if not post_text or len(post_text.strip()) < 10:
-                        continue
-                    
-                    # Extract engagement metrics
-                    metrics = await self._extract_engagement_metrics_improved(post)
-                    
-                    # Create unique identifier for deduplication
-                    post_id = f"{post_text[:50]}_{metrics.get('likes', 0)}"
-                    
-                    # Check for duplicates
-                    if any(existing_post.get('id') == post_id for existing_post in posts_data):
-                        continue
-                    
-                    post_data = {
-                        "id": post_id,
-                        "text": post_text,
-                        "likes": metrics.get("likes", 0),
-                        "comments": metrics.get("comments", 0),
-                        "reposts": metrics.get("reposts", 0),
-                        "engagement": metrics.get("engagement", 0),
-                        "scraped_at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(),
-                        "source": "profile",
-                        "profile_url": profile_url
-                    }
-                    
-                    posts_data.append(post_data)
-                    
-                    print(f"  📊 Post {i+1}: Likes={metrics['likes']}, Comments={metrics['comments']}, Reposts={metrics['reposts']}")
-                    
-                    if self.debug:
-                        print(f"🔍 Post text: {post_text[:100]}...")
-                        
-                except Exception as e:
-                    if self.debug:
-                        print(f"⚠️ Error processing post {i}: {e}")
-                    continue
-            
-            print(f"✅ Scraped {len(posts_data)} posts from {profile_url}")
-            return posts_data
+            return False
             
         except Exception as e:
-            print(f"❌ Error scraping profile posts: {e}")
+            print(f"⚠️ Error trying posts button click: {e}")
+            return False
+
+    async def _scroll_and_load_posts_page(self, n_posts):
+      """Optimized scrolling for fewer posts"""
+      posts_loaded = 0
+      scroll_count = 0
+      max_scrolls = min(8, n_posts // 2 + 3)  # Dynamic max based on needed posts
+      no_new_posts_count = 0
+    
+      while posts_loaded < n_posts and scroll_count < max_scrolls and no_new_posts_count < 3:
+        # Scroll to bottom
+        await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(2)  # Reduced from 3 to 2 seconds
+        
+        # Skip "Show more" clicking for efficiency if we have enough posts
+        if posts_loaded < n_posts:
+            try:
+                show_more_buttons = await self.page.query_selector_all("button:has-text('Show more')")
+                for button in show_more_buttons[:2]:  # Limit to first 2 buttons
+                    try:
+                        await button.click()
+                        await asyncio.sleep(1)  # Reduced wait time
+                    except:
+                        pass
+            except:
+                pass
+        
+        # Count posts (same logic)
+        previous_posts_loaded = posts_loaded
+        post_selectors = [
+            "div[data-urn*='activity']",
+            "div.feed-shared-update-v2", 
+            "article.artdeco-card",
+            "div.profile-creator-shared-feed-update__container"
+        ]
+        
+        for selector in post_selectors:
+            try:
+                posts = await self.page.query_selector_all(selector)
+                posts_loaded = len(posts)
+                if posts_loaded >= n_posts:  # Early exit when we have enough
+                    print(f"✅ Target reached: {posts_loaded}/{n_posts} posts")
+                    return posts_loaded
+                if posts_loaded > 0:
+                    break
+            except:
+                continue
+        
+        print(f"📊 Posts loaded: {posts_loaded}/{n_posts}")
+        
+        # Check progress (reduced tolerance)
+        if posts_loaded == previous_posts_loaded:
+            no_new_posts_count += 1
+        else:
+            no_new_posts_count = 0
+        
+        scroll_count += 1
+    
+      print(f"✅ Finished scrolling. Found {posts_loaded} posts")
+      return posts_loaded
+
+    async def _extract_all_posts(self, n_posts, profile_url):
+        """Extract posts with enhanced selectors and better error handling"""
+        posts_data = []
+        
+        post_selectors = [
+            "div[data-urn*='activity']",
+            "div.feed-shared-update-v2",
+            "article.artdeco-card",
+            "div.profile-creator-shared-feed-update__container"
+        ]
+        
+        posts = []
+        for selector in post_selectors:
+            try:
+                posts = await self.page.query_selector_all(selector)
+                if posts:
+                    print(f"✅ Found {len(posts)} posts with selector: {selector}")
+                    break
+            except:
+                continue
+        
+        if not posts:
+            print("❌ No posts found with any selector")
             return []
+        
+        # Process posts
+        processed_count = 0
+        for i, post in enumerate(posts):
+            if processed_count >= n_posts:
+                break
+            
+            print(f"🔍 Processing post {processed_count + 1}/{n_posts}")
+            
+            try:
+                # Extract post content
+                post_text = await self._extract_post_content(post)
+                if not post_text or len(post_text.strip()) < 10:
+                    print(f"  ⚠️ Skipping post {i+1}: insufficient content")
+                    continue
+                
+                # Extract engagement metrics
+                metrics = await self._extract_engagement_metrics_improved(post)
+                
+                
+                # Create unique identifier for deduplication
+                post_id = f"{post_text[:50]}_{metrics.get('likes', 0)}_{metrics.get('comments', 0)}"
+                
+                # Check for duplicates
+                if any(existing_post.get('id') == post_id for existing_post in posts_data):
+                    print(f"  ⚠️ Skipping post {i+1}: duplicate content")
+                    continue
+                
+                post_data = {
+                    "id": post_id,
+                    "text": post_text,
+                    "likes": metrics.get("likes", 0),
+                    "comments": metrics.get("comments", 0),
+                    "reposts": metrics.get("reposts", 0),
+                    "engagement": metrics.get("engagement", 0),
+                    "scraped_at": datetime.now(timezone(timedelta(hours=5, minutes=30))).isoformat(),
+                    "source": "profile",
+                    "profile_url": profile_url
+                }
+                
+                posts_data.append(post_data)
+                processed_count += 1
+                
+                print(f"  ✅ Post {processed_count}: Likes={metrics['likes']}, Comments={metrics['comments']}, Reposts={metrics['reposts']}")
+                
+                if self.debug:
+                    print(f"🔍 Post text: {post_text[:100]}...")
+                    
+            except Exception as e:
+                if self.debug:
+                    print(f"⚠️ Error processing post {i}: {e}")
+                continue
+        
+        return posts_data
 
     async def scrape_hashtag_posts(self, hashtag, n_posts=5):
-        """Scrape posts for a specific hashtag"""
-        try:
-            # Ensure we're logged in before scraping
-            if not await self.ensure_logged_in():
-                raise Exception("Failed to ensure login status")
-                
-            # Clean hashtag
-            clean_hashtag = hashtag.lstrip('#')
-            hashtag_url = f"https://www.linkedin.com/feed/hashtag/{clean_hashtag}/"
+      """Scrape posts for a specific hashtag"""
+      try:
+        # Ensure we're logged in before scraping
+        if not await self.ensure_logged_in():
+            raise Exception("Failed to ensure login status")
             
-            print(f"🏷️ Navigating to hashtag: #{clean_hashtag}")
-            await self.page.goto(hashtag_url, wait_until="domcontentloaded")
-            await asyncio.sleep(5)
-            
-            # Check if we're on the right page
-            current_url = self.page.url
-            if "hashtag" not in current_url:
-                print("❌ Failed to load hashtag page. Trying alternative approach...")
-                search_url = f"https://www.linkedin.com/search/results/content/?keywords=%23{clean_hashtag}"
-                await self.page.goto(search_url, wait_until="domcontentloaded")
-                await asyncio.sleep(5)
-            
-            print("📜 Scrolling to load hashtag posts...")
-            posts_found = await self._scroll_and_load(n_posts)
-            
-            if posts_found == 0:
-                print("⚠️ No hashtag posts found.")
-                return []
+        # Clean hashtag
+        clean_hashtag = hashtag.lstrip('#')
+        search_url = f"https://www.linkedin.com/search/results/content/?keywords=%23{clean_hashtag}"
+        
+        print(f"🏷️ Navigating to hashtag via search: #{clean_hashtag}")
+        await self.page.goto(search_url, wait_until="domcontentloaded")
+        await asyncio.sleep(5)  # can reduce to 3 if speed is more important
 
-            return await self._scrape_posts_generic(n_posts, {"source": "hashtag", "hashtag": clean_hashtag})
-                    
-        except Exception as e:
-            print(f"❌ Error scraping hashtag posts: {e}")
+        print("📜 Scrolling to load hashtag posts...")
+        posts_found = await self._scroll_and_load(n_posts)
+        
+        if posts_found == 0:
+            print("⚠️ No hashtag posts found.")
             return []
+
+        return await self._scrape_posts_generic(n_posts, {"source": "hashtag", "hashtag": clean_hashtag})
+                    
+      except Exception as e:
+        print(f"❌ Error scraping hashtag posts: {e}")
+        return []
+
 
     async def _scroll_and_load(self, n_posts):
         """Scroll until at least n_posts loaded"""
@@ -610,8 +727,7 @@ class LinkedInBot:
                         if text and len(text.strip()) > 10:
                             # Clean the text
                             text = re.sub(r'\s+', ' ', text.strip())
-                            text = re.sub(r'…see more$', '', text)
-                            return text
+                            text = re.sub(r'see more$', '', text, flags=re.IGNORECASE)
                 except:
                     continue
             
@@ -694,20 +810,61 @@ class LinkedInBot:
         return shutil.which("chrome") or shutil.which("google-chrome") or shutil.which("chromium")
 
     async def close(self, keep_open=False):
-        """Close browser unless debugging"""
+        """Close browser with proper cleanup order and error handling"""
         if keep_open:
-            print("🔍 Debug mode: keeping browser open")
-            return
-        
+         print("🔍 Debug mode: keeping browser open")
+         return
+    
+        errors = []
+
         try:
-            if self.page:
+        # Close in reverse order (page → context → browser → playwright)
+         if getattr(self, "page", None):
+            try:
                 await self.page.close()
-            if self.context:
+                self.page = None
+            except Exception as e:
+                errors.append(f"Page close error: {e}")
+ 
+         if getattr(self, "context", None):
+            try:
                 await self.context.close()
-            if self.browser:
+                self.context = None
+            except Exception as e:
+                errors.append(f"Context close error: {e}")
+
+         if getattr(self, "browser", None):
+            try:
                 await self.browser.close()
-            if self.playwright:
+                self.browser = None
+            except Exception as e:
+                errors.append(f"Browser close error: {e}")
+
+         if getattr(self, "playwright", None):
+            try:
                 await self.playwright.stop()
-            print("✅ Browser closed")
+                self.playwright = None
+            except Exception as e:
+                errors.append(f"Playwright stop error: {e}")
+
+         if errors:
+            print(f"⚠️ Browser close completed with errors: {'; '.join(errors)}")
+         else:
+            print("✅ Browser closed cleanly")
+
         except Exception as e:
-            print(f"⚠️ Error closing browser: {e}")
+          print(f"❌ Critical error during browser close: {e}")
+          # Fallback: force cleanup
+          self.page = None
+          self.context = None
+          self.browser = None
+          self.playwright = None
+          
+    async def is_fully_closed(self):
+        """Verify all resources are properly closed"""
+        return all([
+            self.page is None,
+            self.context is None, 
+            self.browser is None,
+            self.playwright is None
+        ])

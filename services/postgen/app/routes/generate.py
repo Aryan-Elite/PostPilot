@@ -2,87 +2,102 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from typing import Optional, List
+from datetime import datetime
+import httpx
+
 from shared.db.mongo_db import get_database, POSTS_COLLECTION_NAME
-from app.utils.embeddings import get_embedding
-from app.utils.prompt import build_prompt
-from app.llm import generate_post_langchain
+from app.llm import generate_hybrid_post, generate_simple_post
+from app.utils.hybrid_retriever import create_retriever
 from app.config import GENERATED_POSTS_COLLECTION_NAME, SCRAPER_SERVICE_URL
 from app.utils.pinecone import pinecone_service
 from app.models.generated_post import GeneratedPostItem
-from datetime import datetime
-import httpx
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Request body model - FIXED with username field
+
 class GeneratePostRequest(BaseModel):
     prompt: str = Field(..., description="The main prompt for post generation")
     topic: Optional[str] = Field(None, description="Topic for the post")
-    tone: Optional[str] = Field(None, description="Tone of the post (e.g., professional, casual, motivational)")
-    length: Optional[str] = Field(None, description="Desired length of the post (e.g., short, medium, long)")
+    tone: Optional[str] = Field(None, description="Tone of the post")
+    length: Optional[str] = Field(None, description="Desired length of the post")
     audience: Optional[str] = Field(None, description="Target audience")
     hashtag: Optional[str] = Field(None, description="Hashtag to get trending samples")
-    num_variations: Optional[int] = Field(1, ge=1, le=3, description="Number of variations to generate (1-3)")
-    username: Optional[str] = Field(None, description="LinkedIn username (added by main service from JWT)")
+    num_variations: Optional[int] = Field(1, ge=1, le=3, description="Number of variations (1-3)")
+    username: Optional[str] = Field(None, description="LinkedIn username")
 
-async def ensure_user_posts_in_pinecone(username: str, db):
-    """
-    Ensure user's posts are stored in Pinecone vector database
-    Flow: Check Pinecone -> If not found, get from MongoDB -> Embed to Pinecone
-    """
+
+async def ensure_user_posts_in_pinecone(username: str, db) -> bool:
     try:
-        # 1. Check if user posts already exist in Pinecone
         query_response = pinecone_service.index.query(
             vector=[0.0] * 1536,
             filter={"username": username},
             top_k=1,
             include_metadata=True
         )
-        
         if query_response.matches:
-            print(f"User {username} posts found in Pinecone")
             return True
-        
-        print(f"User {username} posts not found in Pinecone, checking MongoDB...")
-        
-        # 2. Get posts from MongoDB (assuming they're already stored by another service)
+
+        # Fetch from MongoDB if not in Pinecone
         user_posts_cursor = db[POSTS_COLLECTION_NAME].find({"username": username})
         user_document = await user_posts_cursor.to_list(length=1)
-        
         if user_document:
-            # User exists in MongoDB - embed their posts to Pinecone
             all_posts = user_document[0].get("posts", [])
             recent_posts = sorted(all_posts, key=lambda x: x.get("scraped_at", ""), reverse=True)[:10]
-            
             if recent_posts:
                 success = pinecone_service.store_user_posts(username, recent_posts)
                 if success:
-                    print(f"Embedded {len(recent_posts)} MongoDB posts to Pinecone for {username}")
                     return True
-                else:
-                    print(f"Failed to embed posts to Pinecone for {username}")
-                    return False
-            else:
-                print(f"User {username} exists in MongoDB but has no posts")
-                return False
-        else:
-            print(f"User {username} not found in MongoDB - posts should be pre-stored by another service")
-            return False
-            
+        return False
     except Exception as e:
-        print(f"Error ensuring user posts in Pinecone: {e}")
+        logger.error(f"Error ensuring user posts in Pinecone: {e}")
         return False
 
-async def save_generated_posts(db, username: str, post_items: List[GeneratedPostItem]) -> str:
-    """
-    Save generated posts to MongoDB (adds to existing array or creates new document)
-    """
+
+async def fetch_trending_posts(hashtag: str) -> str:
+    if not hashtag:
+        return ""
+    
     try:
-        collection = db[GENERATED_POSTS_COLLECTION_NAME]
+        timeout = httpx.Timeout(120.0, connect=15.0)
         
-        existing_doc = await collection.find_one({"username": username})
-        
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(
+                f"{SCRAPER_SERVICE_URL}/scraper/hashtag/posts",
+                params={"hashtag": hashtag, "n_posts": 5}
+            )
+            
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                    posts = data.get("posts", [])
+                    if posts:
+                        trending_text = "\n\n".join([
+                            f"Trending post {i+1}: {post.get('text', '')[:200]}..." 
+                            for i, post in enumerate(posts[:3]) 
+                            if post.get('text', '').strip()
+                        ])
+                        
+                        if trending_text:
+                            return trending_text
+                except Exception:
+                    return ""
+            
+            return ""
+    
+    except (httpx.TimeoutException, httpx.ConnectTimeout, httpx.ReadTimeout):
+        logger.warning(f"Timeout fetching trending posts for hashtag '{hashtag}'")
+        return ""
+    except Exception as e:
+        logger.error(f"Error fetching trending posts for hashtag '{hashtag}': {repr(e)}")
+        return ""
+
+
+async def save_generated_posts(db, username: str, post_items: List[GeneratedPostItem]) -> str:
+    collection = db[GENERATED_POSTS_COLLECTION_NAME]
+    existing_doc = await collection.find_one({"username": username})
+    
+    try:
         if existing_doc:
             await collection.update_one(
                 {"username": username},
@@ -91,7 +106,6 @@ async def save_generated_posts(db, username: str, post_items: List[GeneratedPost
                     "$set": {"updated_at": datetime.utcnow()}
                 }
             )
-            print(f"Added {len(post_items)} posts to existing user document: {username}")
             return str(existing_doc["_id"])
         else:
             new_doc = {
@@ -102,137 +116,103 @@ async def save_generated_posts(db, username: str, post_items: List[GeneratedPost
                 "updated_at": datetime.utcnow()
             }
             result = await collection.insert_one(new_doc)
-            print(f"Created new document for user {username} with {len(post_items)} posts")
             return str(result.inserted_id)
-            
     except Exception as e:
-        print(f"Error saving generated posts: {e}")
+        logger.error(f"Error saving generated posts: {e}")
         raise
+
 
 @router.post("/generate")
 async def generate_post(req: GeneratePostRequest, db=Depends(get_database)):
-    """Enhanced post generation with better user handling"""
     try:
-        logger.info(f"Received post generation request for username: {req.username}")
-        
-        # Extract parameters
-        prompt = req.prompt
-        topic = req.topic
-        tone = req.tone
-        length = req.length
-        audience = req.audience
-        hashtag = req.hashtag
-        num_variations = min(req.num_variations or 1, 3)
         username = req.username
-        
         if not username:
             raise HTTPException(status_code=400, detail="Username is required")
         
-        # Extract username from LinkedIn URL if needed
-        if username and 'linkedin.com' in username:
-            if '/in/' in username:
-                username = username.split('/in/')[-1].rstrip('/')
-        
-        logger.info(f"Processing request for user: {username}")
-        print(f"Processing request for user: {username}")
-        
-        # 1. Ensure user posts are in Pinecone (check Pinecone -> MongoDB -> Embed if needed)
+        # Clean LinkedIn URL if provided
+        if 'linkedin.com' in username and '/in/' in username:
+            username = username.split('/in/')[-1].rstrip('/')
+
+        # Get user context and trending posts
         posts_available = await ensure_user_posts_in_pinecone(username, db)
-        
-        # 2. Find similar style post (only if posts are available)
-        style_sample = None
+        trending_posts = await fetch_trending_posts(req.hashtag)
+
+        # Generate posts based on available context
         if posts_available:
-            style_sample = pinecone_service.find_similar_post(username, prompt)
-            print(f"Style sample found: {'Yes' if style_sample else 'No'}")
+            retriever = create_retriever(alpha=0.5, top_k=5, username=username)
+            generated_posts = generate_hybrid_post(
+                prompt=req.prompt,
+                retriever=retriever,
+                trending_posts=trending_posts,
+                topic=req.topic,
+                tone=req.tone,
+                length=req.length,
+                audience=req.audience,
+                num_variations=req.num_variations or 1
+            )
+            generation_method = "hybrid_rag_trending"
         else:
-            print("No posts available - skipping style sample search")
-        
-        # 3. Get trending post sample
-        trending_sample = None
-        if hashtag:
-            try:
-                async with httpx.AsyncClient() as client:
-                    resp = await client.get(
-                        f"{SCRAPER_SERVICE_URL}/scraper/hashtag/posts",
-                        params={"hashtag": hashtag, "n_posts": 5}
-                    )
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        trending_sample = data.get("top_post")
-                        print(f"Trending sample found: {trending_sample[:100]}..." if trending_sample else "No trending sample")
-            except Exception as e:
-                print(f"Error fetching trending sample: {e}")
-                trending_sample = None
+            enhanced_prompt = req.prompt
+            if trending_posts:
+                enhanced_prompt += f"\n\nContext - Current trending posts:\n{trending_posts}\n\nCreate an original post inspired by these trends."
+            generated_posts = generate_simple_post(prompt=enhanced_prompt, num_variations=req.num_variations or 1)
+            generation_method = "simple_with_trending" if trending_posts else "simple_only"
 
-        # 4. Build prompt
-        final_prompt = build_prompt(prompt, topic, tone, length, audience, style_sample, trending_sample)
-        print("Final prompt built")    
-
-        # 5. Generate posts
-        generated_posts = generate_post_langchain(final_prompt, num_variations=num_variations)
-        logger.info(f"Generated {len(generated_posts)} post variations")
-        
-        # 6. Prepare post items for saving - CORRECTED VERSION
-        post_items = []
-        for i, post_text in enumerate(generated_posts):
-            post_item = GeneratedPostItem(
-                original_prompt=prompt,           # CORRECT FIELD NAME
-                generated_text=post_text,         # CORRECT FIELD NAME
-                parameters={                      # CORRECT - put these in parameters dict
-                    "topic": topic,
-                    "tone": tone,
-                    "length": length, 
-                    "audience": audience,
-                    "hashtag": hashtag
+        # Prepare post items for database
+        post_items = [
+            GeneratedPostItem(
+                original_prompt=req.prompt,
+                generated_text=post_text,
+                parameters={
+                    "topic": req.topic,
+                    "tone": req.tone,
+                    "length": req.length,
+                    "audience": req.audience,
+                    "hashtag": req.hashtag,
+                    "generation_method": generation_method
                 },
-                style_sample_used=style_sample,
-                trending_sample_used=trending_sample,
+                style_sample_used=posts_available,
+                trending_sample_used=bool(trending_posts),
                 variation_number=i + 1,
                 created_at=datetime.utcnow()
             )
-            post_items.append(post_item)
-        
-        logger.info(f"Created {len(post_items)} post items")
-        
-        # 7. Save to MongoDB
+            for i, post_text in enumerate(generated_posts)
+        ]
+
         doc_id = await save_generated_posts(db, username, post_items)
-        logger.info(f"Saved posts to MongoDB with doc_id: {doc_id}")
-        
-        # Return response
+
         return {
             "success": True,
             "variations": generated_posts,
             "username_used": username,
-            "style_sample_found": style_sample is not None,
-            "trending_sample_found": trending_sample is not None,
+            "generation_method": generation_method,
+            "user_context_available": posts_available,
+            "trending_context_available": bool(trending_posts),
             "saved_to_db": True,
-            "document_id": doc_id
+            "document_id": doc_id,
+            "total_variations": len(generated_posts)
         }
-        
+
     except Exception as e:
         logger.error(f"Error in generate_post: {e}")
-        print(f"Error in generate_post: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.get("/history/{username}")
 async def get_user_history(username: str, limit: int = 20, db=Depends(get_database)):
-    """Get generation history for a user"""
     try:
         collection = db[GENERATED_POSTS_COLLECTION_NAME]
         user_doc = await collection.find_one({"username": username})
-        
         if not user_doc:
             return {"success": True, "posts": [], "total_posts": 0}
         
         all_posts = user_doc.get("generated_posts", [])
         sorted_posts = sorted(all_posts, key=lambda x: x.get("created_at"), reverse=True)
-        limited_posts = sorted_posts[:limit]
-        
         return {
-            "success": True,
-            "posts": limited_posts,
-            "total_posts": len(all_posts),
-            "returned": len(limited_posts)
+            "success": True, 
+            "posts": sorted_posts[:limit], 
+            "total_posts": len(all_posts)
         }
     except Exception as e:
+        logger.error(f"Error getting user history: {e}")
         raise HTTPException(status_code=500, detail=str(e))

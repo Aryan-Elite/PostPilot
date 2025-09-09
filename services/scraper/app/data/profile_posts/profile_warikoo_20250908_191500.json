@@ -1,0 +1,30 @@
+{
+  "identifier": "warikoo",
+  "type": "profile",
+  "scraped_at": "2025-09-09T00:45:00.758523+05:30",
+  "total_posts": 2,
+  "posts": [
+    {
+      "id": "At wariCrew, the goal isn’t to spend more hours at_1",
+      "text": "At wariCrew, the goal isn’t to spend more hours at work. The goal is to make the hours you work actually count. So that the team can spend the rest of the day thinking, creating, and actually living. If you’re looking to work with more focus and deliver better outcomes, this list by Colby Kultgen is a great place to start. Start slow - but start now!",
+      "likes": 1,
+      "comments": 111,
+      "reposts": 105,
+      "engagement": 217,
+      "scraped_at": "2025-09-09T00:44:29.341016+05:30",
+      "source": "profile",
+      "profile_url": "https://www.linkedin.com/in/warikoo/"
+    },
+    {
+      "id": "Real respect doesn’t come from qualifications, tit_9",
+      "text": "Real respect doesn’t come from qualifications, titles, or positions. A CEO is not automatically wiser than a janitor. A PhD doesn’t guarantee kindness. A big salary doesn’t mean a big heart. When you strip away the tags, the cars, the labels, the LinkedIn headlines… What remains is a human being. And that alone is worthy of respect. Not because of what they bring to the table. Because they too are living. Struggling. Dreaming, just like you. Respect isn’t earned. It’s what everyone deserves. Image source unknown.",
+      "likes": 9,
+      "comments": 521,
+      "reposts": 340,
+      "engagement": 870,
+      "scraped_at": "2025-09-09T00:44:30.264994+05:30",
+      "source": "profile",
+      "profile_url": "https://www.linkedin.com/in/warikoo/"
+    }
+  ]
+}
